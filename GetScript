@@ -1,0 +1,9 @@
+! 1. Download the script using the RAW link
+! (Adding 'vrf mgmt' is usually required if your internet connection is on the management port)
+nae-script install auto_label_links_nae source https://raw.githubusercontent.com/philhorn/ArubaCX/main/auto_label_links_nae.py vrf mgmt
+
+! 2. Create the Agent 
+nae-agent auto-label-links create auto_label_links_nae
+
+! 3. Enable it
+nae-agent auto-label-links enable
