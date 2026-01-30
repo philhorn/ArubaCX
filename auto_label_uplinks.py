@@ -1,57 +1,52 @@
+# -*- coding: utf-8 -*-
+Manifest = {
+    'Name': 'LLDP_Auto_Labeler',
+    'Description': 'Auto-labels interfaces based on LLDP neighbors',
+    'Version': '1.0',
+    'Author': 'Admin'
+}
+
+from aruba_nae.agents.agent import Agent
+from aruba_nae.action.cli import ActionCLI
 import re
-from cli import cli
 
-def run():
-    # 1. Get the raw text output from the command in your screenshot
-    raw_output = cli("show lldp neighbor-info detail")
-    
-    # 2. Split the output into blocks using the dashed line separator
-    # The regex r'-{10,}' looks for 10 or more dashes in a row
-    entries = re.split(r'-{10,}', raw_output)
-    
-    print(f"Processing {len(entries)} LLDP entries...")
+class Agent(Agent):
+    def on_agent_create(self):
+        # Run every hour (change to 'every 1.minute' for immediate test)
+        self.r1 = self.Rule("LLDP_Update")
+        self.r1.condition("every 1.minute")
+        self.r1.action(self.update_uplinks)
 
-    for entry in entries:
-        # Skip empty entries (often the first or last split)
-        if not entry.strip():
-            continue
-
-        # 3. Extract the specific fields shown in your screenshot
-        # We use re.search to find the specific keys. 
-        # .strip() removes the whitespace padding.
+    def update_uplinks(self, event):
+        cmd = ActionCLI("show lldp neighbor-info detail")
+        output = cmd.execute()
         
-        # Find Local Port (e.g., 1/1/48)
-        local_port_match = re.search(r"Port\s+:\s+(.+)", entry)
+        # Split by dashed lines (robust delimiter)
+        entries = re.split(r'-{10,}', output)
         
-        # Find Remote Hostname (e.g., GS...)
-        sys_name_match = re.search(r"Neighbor System-Name\s+:\s+(.+)", entry)
-        
-        # Find Remote Port (e.g., 1/1/46)
-        remote_port_match = re.search(r"Neighbor Port-ID\s+:\s+(.+)", entry)
-
-        if local_port_match and sys_name_match and remote_port_match:
-            local_port = local_port_match.group(1).strip()
-            sys_name = sys_name_match.group(1).strip()
-            remote_port = remote_port_match.group(1).strip()
-
-            # 4. Clean up the data for the description label
-            # Replace spaces in the hostname with underscores to make it one word
-            clean_sys_name = re.sub(r'\s+', '_', sys_name)
+        for entry in entries:
+            if not entry.strip(): continue
             
-            # Construct the new description
-            new_desc = f"UPLINK_TO_{clean_sys_name}_{remote_port}"
+            # Robust Regex for AOS-CX 10.16 Output
+            p_m = re.search(r"Port\s+:\s+(.+)", entry)
+            s_m = re.search(r"Neighbor System-Name\s+:\s+(.+)", entry)
+            r_m = re.search(r"Neighbor Port-ID\s+:\s+(.+)", entry)
             
-            print(f"Match found: {local_port} connects to {clean_sys_name} ({remote_port})")
-            
-            # 5. Apply the configuration
-            try:
-                cli("configure terminal")
-                cli(f"interface {local_port}")
-                cli(f"description {new_desc}")
-                cli("exit") # exit interface
-                cli("exit") # exit config
-            except Exception as e:
-                print(f"Error configuring {local_port}: {e}")
-
-# Run the logic
-run()
+            if p_m and s_m and r_m:
+                l_port = p_m.group(1).strip()
+                s_name = s_m.group(1).strip()
+                r_port = r_m.group(1).strip()
+                
+                # Sanitize
+                s_name = re.sub(r'\s+', '_', s_name)
+                r_port = re.sub(r'[^a-zA-Z0-9/]', '', r_port)
+                
+                desc = "UPLINK_TO_{}_{}".format(s_name, r_port)
+                
+                # Execute Config
+                # We use a single string with newlines for the command block
+                try:
+                    cmds = "configure terminal\ninterface {}\ndescription {}\nexit\nexit".format(l_port, desc)
+                    ActionCLI(cmds).execute()
+                except:
+                    pass
