@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""
+Aruba AOS-CX automation via Paramiko:
+- SSH to each switch from CSV
+- Run 'hpe-anw-central support-mode' (Central lockout bypass for this session)
+- Discover VLANs using ONLY 'show vlan'
+- Configure global 'client track ip'
+- Configure per-VLAN 'client track ip' excluding specified VLANs
+- Optional 'write memory'
+- Credential test against first switch
+- Parallel execution (default 8 threads)
+
+Refs:
+- hpe-anw-central support-mode is session-only and enables write access during Central lockout.
+- Your configs show client track ip globally and under vlan stanzas.
+"""
+
+import argparse
+import csv
+import getpass
+import re
+import socket
+import sys
+import time
+from dataclasses import dataclass
+from typing import List, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import paramiko
+
+
+# -------------------- Models --------------------
+
+@dataclass
+class SwitchTarget:
+    host: str
+    port: int = 22
+    name: str = ""
+
+
+@dataclass
+class Result:
+    host: str
+    name: str
+    ok: bool
+    message: str
+    vlan_count: int = 0
+    changed_vlan_count: int = 0
+    elapsed_s: float = 0.0
+
+
+# -------------------- CSV / Args helpers --------------------
+
+def parse_targets(csv_path: str) -> List[SwitchTarget]:
+    targets: List[SwitchTarget] = []
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError("CSV has no headers. Need at least: host")
+
+        headers = {h.lower(): h for h in reader.fieldnames}
+        if "host" not in headers:
+            raise ValueError("CSV must include a 'host' column")
+
+        for row in reader:
+            host = (row.get(headers["host"]) or "").strip()
+            if not host:
+                continue
+            port_str = (row.get(headers.get("port", ""), "") or "").strip()
+            port = int(port_str) if port_str else 22
+            name = (row.get(headers.get("name", ""), "") or "").strip()
+            targets.append(SwitchTarget(host=host, port=port, name=name))
+
+    if not targets:
+        raise ValueError("No valid targets found in CSV.")
+    return targets
+
+
+def parse_excludes(exclude_csv: str) -> Set[int]:
+    excludes: Set[int] = set()
+    if not exclude_csv:
+        return excludes
+    for part in exclude_csv.split(","):
+        part = part.strip()
+        if part:
+            excludes.add(int(part))
+    return excludes
+
+
+# -------------------- Paramiko SSH shell utilities --------------------
+
+def _read_channel(chan: paramiko.Channel, timeout_s: float = 10.0) -> str:
+    """Read all currently available data from channel until timeout expires."""
+    end = time.time() + timeout_s
+    data = []
+    while time.time() < end:
+        if chan.recv_ready():
+            chunk = chan.recv(65535).decode("utf-8", errors="ignore")
+            data.append(chunk)
+            end = time.time() + 0.5  # extend while flowing
+        else:
+            time.sleep(0.05)
+    return "".join(data)
+
+
+def detect_prompt(chan: paramiko.Channel) -> str:
+    """Detect prompt by sending newline; handle exec/config prompts ending in # or >."""
+    chan.send("\n")
+    out = _read_channel(chan, timeout_s=3.0)
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    for ln in reversed(lines):
+        s = ln.strip()
+        if s.endswith("#") or s.endswith(">"):
+            return s
+    return "#"
+
+
+def send_cmd(chan: paramiko.Channel, cmd: str, timeout_s: float = 12.0) -> str:
+    """
+    Send a command and read output (best effort).
+    We don't hard-require the prompt string because prompts may vary (exec/config-vlan/etc).
+    """
+    chan.send(cmd.rstrip() + "\n")
+    buf = ""
+    end = time.time() + timeout_s
+    last_len = 0
+
+    while time.time() < end:
+        buf += _read_channel(chan, timeout_s=1.0)
+
+        # If output stopped changing and last non-empty line looks like a prompt, we're done
+        if len(buf) == last_len:
+            lines = [ln for ln in buf.splitlines() if ln.strip()]
+            if lines and (lines[-1].strip().endswith("#") or lines[-1].strip().endswith(">")):
+                break
+        last_len = len(buf)
+
+    return buf
+
+
+def open_shell(host: str, port: int, username: str, password: str, timeout: int):
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        hostname=host,
+        port=port,
+        username=username,
+        password=password,
+        look_for_keys=False,
+        allow_agent=False,
+        timeout=timeout,
+        banner_timeout=timeout,
+        auth_timeout=timeout,
+    )
+    chan = client.invoke_shell(width=200, height=60)
+    time.sleep(0.2)
+    _ = _read_channel(chan, timeout_s=2.0)  # flush banner
+
+    # Disable paging if supported
+    send_cmd(chan, "no page", timeout_s=5.0)
+
+    return client, chan
+
+
+# -------------------- Device logic --------------------
+
+VLAN_LINE_RE = re.compile(r"^\s*(\d{1,4})\s+(\S+)\s+(up|down)\b", re.IGNORECASE)
+
+def get_vlans_show_vlan(output: str) -> List[int]:
+    """
+    Parse VLAN IDs from 'show vlan' output like your sample.
+    Matches lines starting with:
+       <vlan_id> <name> <status>
+    Skips headers because they don't start with digits.
+    """
+    vlan_ids = set()
+    for line in output.splitlines():
+        m = VLAN_LINE_RE.match(line)
+        if m:
+            vid = int(m.group(1))
+            if 1 <= vid <= 4094:
+                vlan_ids.add(vid)
+
+    # Fallback: if formatting differs, accept any line starting with a VLAN ID
+    if not vlan_ids:
+        for line in output.splitlines():
+            m2 = re.match(r"^\s*(\d{1,4})\b", line)
+            if m2:
+                vid = int(m2.group(1))
+                if 1 <= vid <= 4094:
+                    vlan_ids.add(vid)
+
+    return sorted(vlan_ids)
+
+
+def build_config_cmds(vlans: List[int], excludes: Set[int]) -> List[str]:
+    cmds = []
+    cmds.append("client track ip")  # global
+    for vid in vlans:
+        if vid in excludes:
+            continue
+        cmds.append(f"vlan {vid}")
+        cmds.append("client track ip")
+        cmds.append("exit")
+    return cmds
+
+
+def apply_to_switch(
+    target: SwitchTarget,
+    username: str,
+    password: str,
+    excludes: Set[int],
+    dry_run: bool,
+    save: bool,
+    timeout: int
+) -> Result:
+    start = time.time()
+    try:
+        client, chan = open_shell(target.host, target.port, username, password, timeout)
+
+        try:
+            # 1) Central support-mode (session-only) 
+            send_cmd(chan, "hpe-anw-central support-mode", timeout_s=8.0)
+
+            # 2) VLAN discovery (ONLY show vlan)
+            show_out = send_cmd(chan, "show vlan", timeout_s=15.0)
+            vlans = get_vlans_show_vlan(show_out)
+            target_vlans = [v for v in vlans if v not in excludes]
+
+            if dry_run:
+                msg = f"DRY-RUN: would run support-mode + apply global + {len(target_vlans)} VLAN stanzas (excluded={sorted(excludes)})"
+                return Result(target.host, target.name, True, msg,
+                              vlan_count=len(vlans), changed_vlan_count=len(target_vlans),
+                              elapsed_s=time.time() - start)
+
+            # 3) Enter config mode and apply commands
+            send_cmd(chan, "configure terminal", timeout_s=8.0)
+
+            cfg_cmds = build_config_cmds(vlans, excludes)
+            for c in cfg_cmds:
+                send_cmd(chan, c, timeout_s=8.0)
+
+            # 4) Exit config mode
+            send_cmd(chan, "end", timeout_s=6.0)
+
+            # 5) Optional save
+            if save:
+                send_cmd(chan, "write memory", timeout_s=25.0)
+
+            msg = f"Applied support-mode + global + {len(target_vlans)} VLAN stanzas (excluded={sorted(excludes)})"
+            return Result(target.host, target.name, True, msg,
+                          vlan_count=len(vlans), changed_vlan_count=len(target_vlans),
+                          elapsed_s=time.time() - start)
+
+        finally:
+            try:
+                chan.close()
+            except Exception:
+                pass
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    except paramiko.AuthenticationException:
+        return Result(target.host, target.name, False, "AUTH FAILED", elapsed_s=time.time() - start)
+    except (paramiko.SSHException, socket.timeout, TimeoutError) as e:
+        return Result(target.host, target.name, False, f"SSH/TIMEOUT: {e}", elapsed_s=time.time() - start)
+    except Exception as e:
+        return Result(target.host, target.name, False, f"ERROR: {e}", elapsed_s=time.time() - start)
+
+
+# -------------------- Main --------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", required=True, help="CSV with at least a 'host' column")
+    ap.add_argument("--exclude", default="1,990", help="Comma-separated VLAN IDs to exclude (default: 1,990)")
+    ap.add_argument("--threads", type=int, default=8, help="Max concurrent threads (default: 8)")
+    ap.add_argument("--dry-run", action="store_true", help="Do not push config; only report actions")
+    ap.add_argument("--save", action="store_true", help="Save config (write memory) after changes")
+    ap.add_argument("--timeout", type=int, default=20, help="SSH timeout seconds (default: 20)")
+    ap.add_argument("--out", default="results.csv", help="Write per-switch results to this CSV (default: results.csv)")
+    args = ap.parse_args()
+
+    targets = parse_targets(args.csv)
+    excludes = parse_excludes(args.exclude)
+
+    username = input("Username: ").strip()
+    password = getpass.getpass("Password: ")
+
+    # Credential test (non-invasive): dry-run on first switch
+    test = targets[0]
+    print(f"\nTesting credentials on first switch: {test.host}:{test.port} ...")
+    test_res = apply_to_switch(test, username, password, excludes, dry_run=True, save=False, timeout=args.timeout)
+    if not test_res.ok:
+        print(f"Credential test failed on {test.host}: {test_res.message}")
+        sys.exit(2)
+    print("Credential test OK. Proceeding...\n")
+
+    results: List[Result] = []
+    with ThreadPoolExecutor(max_workers=args.threads) as ex:
+        futs = {ex.submit(apply_to_switch, t, username, password, excludes,
+                          args.dry_run, args.save, args.timeout): t for t in targets}
+        for fut in as_completed(futs):
+            t = futs[fut]
+            res = fut.result()
+            results.append(res)
+            tag = "OK" if res.ok else "FAIL"
+            nm = f" ({res.name})" if res.name else ""
+            print(f"[{tag}] {res.host}{nm} - {res.message} "
+                  f"(vlans={res.vlan_count}, changed={res.changed_vlan_count}, {res.elapsed_s:.1f}s)")
+
+    # Write results
+    with open(args.out, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["host", "name", "ok", "message", "vlan_count", "changed_vlan_count", "elapsed_s"])
+        for r in results:
+            w.writerow([r.host, r.name, r.ok, r.message, r.vlan_count, r.changed_vlan_count, f"{r.elapsed_s:.2f}"])
+
+    ok_count = sum(1 for r in results if r.ok)
+    print(f"\nDone. Success: {ok_count}/{len(results)}. Results written to {args.out}")
+
+
+if __name__ == "__main__":
+    main()
