@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""
+Aruba AOS-CX: enable "client track ip" globally and per VLAN (excluding specified VLANs)
+- Reads switches from CSV
+- Prompts for username/password at runtime
+- Tests creds on first switch
+- Executes with up to 8 threads
+- Supports dry-run and optional save (write memory)
+
+Install Netmiko
+pip install netmiko
+
+Csv sample format:
+host,port,name
+10.1.2.3,22,IDF-20-S02
+10.1.2.4,22,IDF-19-S02
+``
+
+
+Usage examples:
+  python cx_client_track_ip.py --csv switches.csv --exclude 1,990 --save
+  python cx_client_track_ip.py --csv switches.csv --exclude 1,990 --dry-run
+"""
+
+import argparse
+import csv
+import getpass
+import re
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import List, Set, Dict, Optional
+
+from netmiko import ConnectHandler
+from netmiko.ssh_exception import NetmikoTimeoutException, NetmikoAuthenticationException
+
+
+# ----- Models / helpers -----
+
+@dataclass
+class SwitchTarget:
+    host: str
+    port: int = 22
+    name: str = ""
+
+@dataclass
+class Result:
+    host: str
+    name: str
+    ok: bool
+    message: str
+    vlan_count: int = 0
+    changed_vlan_count: int = 0
+    elapsed_s: float = 0.0
+
+
+def parse_targets(csv_path: str) -> List[SwitchTarget]:
+    targets = []
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or "host" not in [h.lower() for h in reader.fieldnames]:
+            raise ValueError("CSV must contain a 'host' column")
+
+        # map headers case-insensitively
+        headers = {h.lower(): h for h in reader.fieldnames}
+        for row in reader:
+            host = (row.get(headers["host"]) or "").strip()
+            if not host:
+                continue
+            port = int((row.get(headers.get("port", ""), "") or "22").strip() or "22")
+            name = (row.get(headers.get("name", ""), "") or "").strip()
+            targets.append(SwitchTarget(host=host, port=port, name=name))
+    if not targets:
+        raise ValueError("No valid targets found in CSV.")
+    return targets
+
+
+def parse_excludes(exclude_csv: str) -> Set[int]:
+    excludes = set()
+    if not exclude_csv:
+        return excludes
+    for part in exclude_csv.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        excludes.add(int(part))
+    return excludes
+
+
+def connect_aoscx(host: str, port: int, username: str, password: str, timeout: int = 20):
+    """
+    Netmiko device_type for AOS-CX is typically 'aruba_aoscx'.
+    If your environment requires a different driver, you can add a CLI arg and pass it through.
+    """
+    device = {
+        "device_type": "aruba_aoscx",
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": password,
+        "timeout": timeout,
+        "conn_timeout": timeout,
+        "banner_timeout": timeout,
+        "auth_timeout": timeout,
+        "fast_cli": False,  # safer for config operations
+    }
+    return ConnectHandler(**device)
+
+
+def get_vlans(conn) -> List[int]:
+    """
+    Pull VLAN IDs from AOS-CX.
+    Common commands: 'show vlan' or 'show vlan brief'
+    We'll try both and parse numeric VLAN IDs from the output.
+
+    Parsing strategy:
+      - Look for lines that start with a VLAN ID (1-4094), optionally preceded by spaces.
+    """
+    output = conn.send_command("show vlan brief", expect_string=r"#|\>")
+    if "Invalid input" in output or not output.strip():
+        output = conn.send_command("show vlan", expect_string=r"#|\>")
+
+    vlan_ids = set()
+    # Typical output lines often begin with VLAN ID; capture 1..4094
+    for line in output.splitlines():
+        m = re.match(r"^\s*(\d{1,4})\b", line)
+        if m:
+            vid = int(m.group(1))
+            if 1 <= vid <= 4094:
+                vlan_ids.add(vid)
+
+    return sorted(vlan_ids)
+
+
+def build_config(vlans: List[int], excludes: Set[int]) -> List[str]:
+    """
+    Build the config commands:
+      - global: client track ip
+      - per-vlan: vlan <id> ; client track ip ; exit
+    """
+    cmds = []
+    cmds.append("client track ip")  # global command (as seen in internal config snippets)
+    target_vlans = [v for v in vlans if v not in excludes]
+    for vid in target_vlans:
+        cmds.append(f"vlan {vid}")
+        cmds.append("client track ip")
+        cmds.append("exit")
+    return cmds
+
+
+def apply_to_switch(
+    target: SwitchTarget,
+    username: str,
+    password: str,
+    excludes: Set[int],
+    dry_run: bool,
+    save: bool,
+    per_host_timeout: int = 20
+) -> Result:
+    start = time.time()
+    try:
+        conn = connect_aoscx(target.host, target.port, username, password, timeout=per_host_timeout)
+        try:
+            vlans = get_vlans(conn)
+            cfg = build_config(vlans, excludes)
+
+            changed_vlan_count = max(0, len([v for v in vlans if v not in excludes]))
+            if dry_run:
+                msg = f"DRY-RUN: would apply global + {changed_vlan_count} VLAN stanzas (excluded={sorted(excludes)})"
+                return Result(target.host, target.name, True, msg, vlan_count=len(vlans), changed_vlan_count=changed_vlan_count,
+                              elapsed_s=time.time() - start)
+
+            # Send config set
+            output = conn.send_config_set(cfg)
+
+            # Optionally save
+            if save:
+                # AOS-CX commonly supports 'write memory'
+                save_out = conn.send_command("write memory", expect_string=r"#|\>")
+                output = f"{output}\n{save_out}"
+
+            msg = f"Applied global + {changed_vlan_count} VLAN stanzas (excluded={sorted(excludes)})"
+            return Result(target.host, target.name, True, msg, vlan_count=len(vlans), changed_vlan_count=changed_vlan_count,
+                          elapsed_s=time.time() - start)
+        finally:
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
+
+    except NetmikoAuthenticationException:
+        return Result(target.host, target.name, False, "AUTH FAILED", elapsed_s=time.time() - start)
+    except NetmikoTimeoutException:
+        return Result(target.host, target.name, False, "TIMEOUT", elapsed_s=time.time() - start)
+    except Exception as e:
+        return Result(target.host, target.name, False, f"ERROR: {e}", elapsed_s=time.time() - start)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", required=True, help="CSV file with at least a 'host' column")
+    ap.add_argument("--exclude", default="1,990", help="Comma-separated VLAN IDs to exclude (default: 1,990)")
+    ap.add_argument("--threads", type=int, default=8, help="Max concurrent threads (default: 8)")
+    ap.add_argument("--dry-run", action="store_true", help="Do not push config; just report what would change")
+    ap.add_argument("--save", action="store_true", help="Save config (write memory) after changes")
+    ap.add_argument("--timeout", type=int, default=20, help="Per-host SSH timeout seconds (default: 20)")
+    ap.add_argument("--out", default="results.csv", help="Write per-switch results to this CSV (default: results.csv)")
+    args = ap.parse_args()
+
+    targets = parse_targets(args.csv)
+    excludes = parse_excludes(args.exclude)
+
+    username = input("Username: ").strip()
+    password = getpass.getpass("Password: ")
+
+    # --- test creds on first switch ---
+    test_target = targets[0]
+    print(f"\nTesting credentials on first switch: {test_target.host}:{test_target.port} ...")
+    test_res = apply_to_switch(
+        test_target, username, password, excludes,
+        dry_run=True,  # do not change on test
+        save=False,
+        per_host_timeout=args.timeout
+    )
+    if not test_res.ok:
+        print(f"Credential test failed on {test_target.host}: {test_res.message}")
+        sys.exit(2)
+
+    print("Credential test OK. Proceeding...\n")
+
+    # --- run parallel execution ---
+    results: List[Result] = []
+    with ThreadPoolExecutor(max_workers=args.threads) as ex:
+        fut_map = {
+            ex.submit(
+                apply_to_switch, t, username, password, excludes,
+                args.dry_run, args.save, args.timeout
+            ): t for t in targets
+        }
+
+        for fut in as_completed(fut_map):
+            t = fut_map[fut]
+            res = fut.result()
+            results.append(res)
+            tag = "OK" if res.ok else "FAIL"
+            display_name = f" ({res.name})" if res.name else ""
+            print(f"[{tag}] {res.host}{display_name} - {res.message} (vlans={res.vlan_count}, changed={res.changed_vlan_count}, {res.elapsed_s:.1f}s)")
+
+    # --- write results to CSV ---
+    with open(args.out, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["host", "name", "ok", "message", "vlan_count", "changed_vlan_count", "elapsed_s"])
+        for r in results:
+            w.writerow([r.host, r.name, r.ok, r.message, r.vlan_count, r.changed_vlan_count, f"{r.elapsed_s:.2f}"])
+
+    ok_count = sum(1 for r in results if r.ok)
+    print(f"\nDone. Success: {ok_count}/{len(results)}. Results written to {args.out}")
+
+
+if __name__ == "__main__":
+    main()
+``
