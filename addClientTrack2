@@ -11,8 +11,8 @@ Aruba AOS-CX automation via Paramiko:
 - Parallel execution (default 8 threads)
 
 Refs:
-- hpe-anw-central support-mode is session-only and enables write access during Central lockout. [1](https://outlook.office365.com/owa/?ItemID=AAMkADY1MGI3NzNlLTJhMGQtNDRiOS04YzM4LWI4MjZkZmY5ZDA0MgBGAAAAAADt8p0Sk9sKRahGFmrhS5wIBwAfw4q46SpyQLC7lXOsZwPPAAAFpwqTAAAfw4q46SpyQLC7lXOsZwPPAAD49SG2AAA%3d&exvsurl=1&viewmodel=ReadMessageItem)
-- Your configs show client track ip globally and under vlan stanzas. [2](https://guidestone-my.sharepoint.com/personal/phorn_guidestone_org/Documents/Documents/troubleshooting/Floor19TEMPLATE.txt?web=1)[3](https://guidestone-my.sharepoint.com/personal/phorn_guidestone_org/Documents/Documents/PowerShell/Scripts/SwitchConfigFl23.txt?web=1)[4](https://guidestone-my.sharepoint.com/personal/phorn_guidestone_org/Documents/Documents/troubleshooting/Floor19RunningConfig.txt?web=1)[5](https://outlook.office365.com/owa/?ItemID=AAMkADY1MGI3NzNlLTJhMGQtNDRiOS04YzM4LWI4MjZkZmY5ZDA0MgBGAAAAAADt8p0Sk9sKRahGFmrhS5wIBwAfw4q46SpyQLC7lXOsZwPPAAAAAAEJAAAfw4q46SpyQLC7lXOsZwPPAAA%2fUIQHAAA%3d&exvsurl=1&viewmodel=ReadMessageItem)[6](https://outlook.office365.com/owa/?ItemID=AAMkADY1MGI3NzNlLTJhMGQtNDRiOS04YzM4LWI4MjZkZmY5ZDA0MgBGAAAAAADt8p0Sk9sKRahGFmrhS5wIBwAfw4q46SpyQLC7lXOsZwPPAAAAAAEJAAAfw4q46SpyQLC7lXOsZwPPAAA5zxNaAAA%3d&exvsurl=1&viewmodel=ReadMessageItem)
+- hpe-anw-central support-mode is session-only and enables write access during Central lockout.
+- Your configs show client track ip globally and under vlan stanzas.
 """
 
 import argparse
@@ -219,7 +219,7 @@ def apply_to_switch(
         client, chan = open_shell(target.host, target.port, username, password, timeout)
 
         try:
-            # 1) Central support-mode (session-only) [1](https://outlook.office365.com/owa/?ItemID=AAMkADY1MGI3NzNlLTJhMGQtNDRiOS04YzM4LWI4MjZkZmY5ZDA0MgBGAAAAAADt8p0Sk9sKRahGFmrhS5wIBwAfw4q46SpyQLC7lXOsZwPPAAAFpwqTAAAfw4q46SpyQLC7lXOsZwPPAAD49SG2AAA%3d&exvsurl=1&viewmodel=ReadMessageItem)
+            # 1) Central support-mode (session-only) 
             send_cmd(chan, "hpe-anw-central support-mode", timeout_s=8.0)
 
             # 2) VLAN discovery (ONLY show vlan)
@@ -324,4 +324,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-``
+
