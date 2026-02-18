@@ -32,6 +32,10 @@ Enhancements:
   - Multi-threaded add/delete/audit/bulk-config
   - Audit display auto-fits columns to terminal width OR forces any N columns you choose
   - Preserves each device 'show users' order (no re-sorting)
+  Here's a sample CSV
+Floor,,Description,Model,SerialNumber,MAC Address,Switch IP,Hostname
+1,snmp-server sysname ,Sw1Descrip,M4250-9G1F-PoE+,SERIAlnumbr1,54:07:7d:11:11:11,10.1.1.1,Hostname1
+2,snmp-server sysname ,Sw2Descrip,M4250-9G1F-PoE+,SERIALnumbr2,54:07:7d:11:11:12,10.1.1.2,Hostname2  
 """
 
 # ===========================
